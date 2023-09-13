@@ -789,6 +789,11 @@ Usage:
             Also see '--sync-docs' option for copying these generated
             documentation files elsewhere.
 
+        --make <make-command>
+            Override make command, e.g. `--make gmake`.
+            If not specified, we use $MUPDF_MAKE. If this is not set, we use
+            `make` (or `gmake` on OpenBSD).
+
         --ref
             Copy generated C++ files to mupdfwrap_ref/ directory for use by --diff.
 
@@ -1178,7 +1183,30 @@ def _test_get_m_command():
     jlib.log( '_get_m_command() ok')
 
 
-def _get_m_command( build_dirs, j=None):
+def get_so_version( build_dirs):
+    '''
+    Returns `.<minor>.<patch>` from include/mupdf/fitz/version.h.
+
+    Returns '' on macos.
+    '''
+    if state.state_.macos:
+        return ''
+    d = dict()
+    def get_v( name):
+        path = f'{build_dirs.dir_mupdf}/include/mupdf/fitz/version.h'
+        with open( path) as f:
+            for line in f:
+                m = re.match(f'^#define {name} (.+)\n$', line)
+                if m:
+                    return m.group(1)
+        assert 0, f'Cannot find #define of {name=} in {path=}.'
+    major = get_v('FZ_VERSION_MAJOR')
+    minor = get_v('FZ_VERSION_MINOR')
+    patch = get_v('FZ_VERSION_PATCH')
+    return f'.{minor}.{patch}'
+
+
+def _get_m_command( build_dirs, j=None, make=None):
     '''
     Generates a `make` command for building with `build_dirs.dir_mupdf`.
 
@@ -1186,13 +1214,18 @@ def _get_m_command( build_dirs, j=None):
     '''
     assert not state.state_.windows, 'Cannot do "-b m" on Windows; C library is integrated into C++ library built by "-b 01"'
     #jlib.log( '{build_dirs.dir_mupdf=}')
-    make = 'make'
-    if state.state_.openbsd:
-        # Need to run gmake, not make. Also for some
-        # reason gmake on OpenBSD sets CC to clang, but
-        # CXX to g++, so need to force CXX=clang++ too.
-        #
-        make = 'CXX=clang++ gmake'
+    if not make:
+        make = os.environ.get('MUPDF_MAKE')
+        jlib.log('Overriding from $MUPDF_MAKE={make}.')
+    if not make:
+        if state.state_.openbsd:
+            # Need to run gmake, not make. Also for some
+            # reason gmake on OpenBSD sets CC to clang, but
+            # CXX to g++, so need to force CXX=clang++ too.
+            #
+            make = 'CXX=clang++ gmake'
+    if not make:
+        make = 'make'
 
     if j is not None:
         if j == 0:
@@ -1314,6 +1347,7 @@ def macos_patch( library, *sublibraries):
     jlib.log( f'macos_patch(): library={library}  sublibraries={sublibraries}')
     if not state.state_.macos:
         return
+    # Find what shared libraries are used by `library`.
     jlib.system( f'otool -L {library}', out='log')
     command = 'install_name_tool'
     names = []
@@ -1322,7 +1356,13 @@ def macos_patch( library, *sublibraries):
         name = name.split('\n')
         assert len(name) == 2 and name[0] == f'{sublibrary}:', f'{name=}'
         name = name[1]
-        command += f' -change {name} @rpath/{os.path.basename(name)}'
+        # strip trailing so_name.
+        leaf = os.path.basename(name)
+        m = re.match('^(.+[.]((so)|(dylib)))[0-9.]*$', leaf)
+        assert m
+        jlib.log(f'Changing {leaf=} to {m.group(1)}')
+        leaf = m.group(1)
+        command += f' -change {name} @rpath/{leaf}'
     command += f' {library}'
     jlib.system( command, out='log')
     jlib.system( f'otool -L {library}', out='log')
@@ -1444,7 +1484,7 @@ def link_l_flags(sos):
     return jlib.link_l_flags( sos, ld_origin)
 
 
-def build( build_dirs, swig_command, args, vs_upgrade):
+def build( build_dirs, swig_command, args, vs_upgrade, make_command):
     '''
     Handles -b ...
     '''
@@ -1549,6 +1589,7 @@ def build( build_dirs, swig_command, args, vs_upgrade):
     dir_so_flags = os.path.basename( build_dirs.dir_so).split( '-')
 
     windows_build_type = build_dirs.windows_build_type()
+    so_version = get_so_version( build_dirs)
 
     for action in actions:
         with jlib.LogPrefixScope( f'{action}: '):
@@ -1563,8 +1604,11 @@ def build( build_dirs, swig_command, args, vs_upgrade):
                     jlib.log( 'Ignoring `-b m` on Windows as not required.')
                 else:
                     jlib.log( 'Building libmupdf.so ...')
-                    command, actual_build_dir, suffix = _get_m_command( build_dirs, j)
+                    command, actual_build_dir, suffix = _get_m_command( build_dirs, j, make_command)
                     jlib.system( command, prefix=jlib.log_text(), out='log', verbose=1)
+
+                    suffix2 = '.dylib' if state.state_.macos else '.so'
+                    assert os.path.isfile(f'{actual_build_dir}/libmupdf{suffix2}{so_version}')
 
                     if actual_build_dir != build_dirs.dir_so:
                         # This happens when we are being run by
@@ -1575,7 +1619,6 @@ def build( build_dirs, swig_command, args, vs_upgrade):
                         # build/shared-release/libmupdf.so, so we need
                         # to copy into build/shared-release-x64-py3.8/.
                         #
-                        suffix2 = '.dylib' if state.state_.macos else '.so'
                         jlib.fs_copy( f'{actual_build_dir}/libmupdf{suffix2}', f'{build_dirs.dir_so}/libmupdf{suffix2}', verbose=1)
 
             elif action == '0':
@@ -1625,8 +1668,8 @@ def build( build_dirs, swig_command, args, vs_upgrade):
                     for i in cpp_files:
                         cpp_files_text += ' ' + os.path.relpath(i)
                     if 'shared' in dir_so_flags:
-                        libmupdfcpp = f'{build_dirs.dir_so}/libmupdfcpp.so'
-                        libmupdf = f'{build_dirs.dir_so}/libmupdf.so'
+                        libmupdfcpp = f'{build_dirs.dir_so}/libmupdfcpp.so{so_version}'
+                        libmupdf = f'{build_dirs.dir_so}/libmupdf.so{so_version}'
                         command = ( textwrap.dedent(
                                 f'''
                                 {compiler}
@@ -1646,7 +1689,9 @@ def build( build_dirs, swig_command, args, vs_upgrade):
                                 command,
                                 force_rebuild,
                                 )
-                        macos_patch( libmupdfcpp, f'{build_dirs.dir_so}/libmupdf.dylib')
+                        macos_patch( libmupdfcpp, f'{build_dirs.dir_so}/libmupdf.dylib{so_version}')
+                        if so_version:
+                            jlib.system(f'ln -sf libmupdfcpp.so{so_version} {build_dirs.dir_so}/libmupdfcpp.so')
 
                     elif 'fpic' in dir_so_flags:
                         # We build a .so containing the C and C++ API. This
@@ -1920,9 +1965,9 @@ def build( build_dirs, swig_command, args, vs_upgrade):
 
                     dir_so_flags = os.path.basename( build_dirs.dir_so).split( '-')
                     if 'shared' in dir_so_flags:
-                        libmupdf        = f'{build_dirs.dir_so}/libmupdf.so'
+                        libmupdf        = f'{build_dirs.dir_so}/libmupdf.so{so_version}'
                         libmupdfthird   = f''
-                        libmupdfcpp     = f'{build_dirs.dir_so}/libmupdfcpp.so'
+                        libmupdfcpp     = f'{build_dirs.dir_so}/libmupdfcpp.so{so_version}'
                     elif 'fpic' in dir_so_flags:
                         libmupdf        = f'{build_dirs.dir_so}/libmupdf.a'
                         libmupdfthird   = f'{build_dirs.dir_so}/libmupdf-third.a'
@@ -1935,7 +1980,7 @@ def build( build_dirs, swig_command, args, vs_upgrade):
                         out_so = f'{build_dirs.dir_so}/_mupdf.so'
                     elif build_csharp:
                         cpp_path = f'{build_dirs.dir_mupdf}/platform/csharp/mupdfcpp_swig.cpp'
-                        out_so = f'{build_dirs.dir_so}/mupdfcsharp.so'
+                        out_so = f'{build_dirs.dir_so}/mupdfcsharp.so'  # todo: append {so_version} ?
 
                     if state.state_.openbsd:
                         # clang needs around 2G on OpenBSD.
@@ -2006,9 +2051,9 @@ def build( build_dirs, swig_command, args, vs_upgrade):
                     # module) using the same underlying C library.
                     #
                     sos = []
-                    sos.append( f'{build_dirs.dir_so}/libmupdfcpp.so')
+                    sos.append( f'{build_dirs.dir_so}/libmupdfcpp.so{so_version}')
                     if os.path.basename( build_dirs.dir_so).startswith( 'shared-'):
-                        sos.append( f'{build_dirs.dir_so}/libmupdf.so')
+                        sos.append( f'{build_dirs.dir_so}/libmupdf.so{so_version}')
                     command = ( textwrap.dedent(
                             f'''
                             {compiler}
@@ -2043,8 +2088,8 @@ def build( build_dirs, swig_command, args, vs_upgrade):
                             force_rebuild,
                             )
                     macos_patch( out_so,
-                            f'{build_dirs.dir_so}/libmupdf.dylib',
-                            f'{build_dirs.dir_so}/libmupdfcpp.so',
+                            f'{build_dirs.dir_so}/libmupdf.dylib{so_version}',
+                            f'{build_dirs.dir_so}/libmupdfcpp.so{so_version}',
                             )
             else:
                 raise Exception( 'unrecognised --build action %r' % action)
@@ -2288,9 +2333,10 @@ def main2():
     #
     build_dirs = state.BuildDirs()
 
-    # Set default swig.
+    # Set default swig and make.
     #
     swig_command = 'swig'
+    make_command = None
 
     # Whether to use `devenv.com /upgrade`.
     #
@@ -2313,7 +2359,7 @@ def main2():
                 print( __doc__)
 
             elif arg == '--build' or arg == '-b':
-                build( build_dirs, swig_command, args, vs_upgrade)
+                build( build_dirs, swig_command, args, vs_upgrade, make_command)
 
             elif arg == '--check-headers':
                 keep_going = False
@@ -2393,6 +2439,9 @@ def main2():
             elif arg == '--doc':
                 languages = args.next()
                 make_docs( build_dirs, languages)
+
+            elif arg == '--make':
+                make_command = args.next()
 
             elif arg == '--ref':
                 assert 'mupdfwrap_ref' in build_dirs.ref_dir
